@@ -1,0 +1,11 @@
+trackId,frame,action_tags,speed_tags
+4,0,['waiting'],"['stopped', 'constant_speed']"
+4,1,['waiting'],"['stopped', 'constant_speed']"
+4,2,['waiting'],"['stopped', 'constant_speed']"
+4,3,['moving'],"['slow', 'constant_speed']"
+4,4,['moving'],"['slow', 'constant_speed']"
+4,5,['moving'],"['slow', 'constant_speed']"
+4,6,['waiting'],"['stopped', 'constant_speed']"
+4,7,['waiting'],"['stopped', 'constant_speed']"
+4,8,['moving'],"['slow', 'constant_speed']"
+4,9,['moving'],"['slow', 'constant_speed']"
