@@ -4,6 +4,7 @@ Visualization script for moving trajectories with tags.
 Displays moving bounding boxes with action and speed tags overlaid.
 """
 
+import json
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,6 +19,8 @@ import warnings
 import os
 from PIL import Image
 import cv2
+import polars as pl
+
 warnings.filterwarnings('ignore')    
 plt.rcParams["font.family"] = 'WenQuanYi Zen Hei' #Droid Sans Fallback
 plt.rcParams["axes.unicode_minus"] = False
@@ -44,6 +47,16 @@ class TrajectoryVisualizer:
         self.frame_text = None  # Text object for frame number display
         self.background_extent = None  # Will store the extent of the background image
         
+        # Playback control variables
+        self.is_playing = True
+        self.is_reverse = False
+        self.speed_multiplier = 1.0
+        self.current_frame_index = 0
+        self.frames_list = []
+        self.animation_obj = None
+        self.control_text = None  # Text object for control instructions
+        self.base_interval = 50  # Base interval in ms for normal speed (~15 FPS)
+        
         # Dataset specific parameters - no scaling needed for full display
         self.ortho_px_to_meter = 0.0499967249445942  # From recording meta
         
@@ -57,10 +70,11 @@ class TrajectoryVisualizer:
             'turning_right': [0.866, 0.674, 0.188],
             '左轉': [0.466, 0.974, 0.2],
             '右轉': '#3b2d15',
-            '直行': 'lightblue', 
+            '路口直行': 'lightblue', 
             'accelerating': 'orange',
             'decelerating': 'purple',
-            'moving': 'blue',
+            'straight': 'blue',
+            'moving': 'darkseagreen',
             'stopped': 'gray'
         }
         
@@ -70,11 +84,12 @@ class TrajectoryVisualizer:
     def load_data(self):
         """Load tags and trajectory data."""
         print("Loading tags data...")
-        self.tags_df = pd.read_csv(self.tags_file)
+        self.tags_df = pd.read_parquet("/home/hcis-s19/Documents/ChengYu/HetroD_sample/tags.parquet")
         
-        # Parse the string representations of lists
-        self.tags_df['action_tags'] = self.tags_df['action_tags'].apply(ast.literal_eval)
-        self.tags_df['speed_tags'] = self.tags_df['speed_tags'].apply(ast.literal_eval)
+        # # Parse the string representations of lists
+        # self.tags_df['action_tags'] = self.tags_df['action_tags'].apply(ast.literal_eval)
+        # self.tags_df['speed_tags'] = self.tags_df['speed_tags'].apply(ast.literal_eval)
+        
         
         print("Loading trajectory data...")
         # Load trajectory data in chunks to handle large files efficiently
@@ -108,8 +123,10 @@ class TrajectoryVisualizer:
         Returns:
             Tuple of (action_string, speed_string)
         """
-        action_str = ', '.join(action_tags) if action_tags else 'unknown'
-        speed_str = ', '.join(speed_tags) if speed_tags else 'unknown'
+        # Remove 'moving' and 'waiting' from action tags for cleaner display
+        action_tags = [tag for tag in action_tags if tag != 'moving' and tag != 'waiting']
+        action_str = ', '.join(action_tags) if action_tags else ''
+        speed_str = ', '.join(speed_tags) if speed_tags else ''
         return action_str, speed_str
     
     def get_color_for_action(self, action_tags: List[str]) -> str:
@@ -163,6 +180,121 @@ class TrajectoryVisualizer:
                         angle=heading, rotation_point='center')
         return rect
     
+    def on_key_press(self, event):
+        """
+        Handle keyboard events for playback control.
+        
+        Args:
+            event: Keyboard event
+        """
+        if event.key == ' ':  # Spacebar - toggle play/pause
+            self.is_playing = not self.is_playing
+            status = "Playing" if self.is_playing else "Paused"
+            print(f"Animation {status}")
+        
+        elif event.key == 'left':  # Left arrow - reverse
+            self.is_reverse = True
+            if not self.is_playing:
+                self.is_playing = True
+            print("Reverse playback")
+        
+        elif event.key == 'right':  # Right arrow - forward
+            self.is_reverse = False
+            if not self.is_playing:
+                self.is_playing = True
+            print("Forward playback")
+        
+        elif event.key == 'up':  # Up arrow - speed up
+            self.speed_multiplier = min(self.speed_multiplier * 1.5, 5.0)
+            print(f"Speed: {self.speed_multiplier:.1f}x")
+            self.restart_animation()
+        
+        elif event.key == 'down':  # Down arrow - slow down
+            self.speed_multiplier = max(self.speed_multiplier / 1.5, 0.2)
+            print(f"Speed: {self.speed_multiplier:.1f}x")
+            self.restart_animation()
+        
+        elif event.key == 'r':  # R key - reset to normal speed and forward
+            self.speed_multiplier = 1.0
+            self.is_reverse = False
+            self.is_playing = True
+            print("Reset to normal speed and forward playback")
+            self.restart_animation()
+        
+        elif event.key == 'escape':  # Escape - quit
+            plt.close(self.fig)
+        
+        # Update control instructions
+        self.update_control_text()
+    
+    def update_control_text(self):
+        """Update the control instructions text display."""
+        direction = "Reverse" if self.is_reverse else "Forward"
+        status = "Playing" if self.is_playing else "Paused"
+        controls = (f"Controls: Space=Play/Pause | ←→=Direction | ↑↓=Speed | R=Reset | ESC=Quit\n"
+                   f"Status: {status} | Direction: {direction} | Speed: {self.speed_multiplier:.1f}x")
+        
+        if self.control_text:
+            self.control_text.set_text(controls)
+    
+    def get_next_frame_index(self):
+        """
+        Get the next frame index based on playback direction and speed.
+        
+        Returns:
+            Next frame index
+        """
+        if not self.is_playing:
+            return self.current_frame_index
+        
+        step = int(self.speed_multiplier)
+        if step < 1:
+            # When speed is very slow, we keep step=1 but adjust interval timing instead
+            step = 1
+        
+        if self.is_reverse:
+            self.current_frame_index = max(0, self.current_frame_index - step)
+        else:
+            self.current_frame_index = min(len(self.frames_list) - 1, self.current_frame_index + step)
+        
+        return self.current_frame_index
+    
+    def get_current_interval(self):
+        """
+        Calculate the current interval for animation based on speed multiplier.
+        When speed_multiplier < 1, we increase the interval to slow down playback.
+        
+        Returns:
+            Current interval in milliseconds
+        """
+        if self.speed_multiplier < 1:
+            # For slow speeds, increase interval proportionally
+            return int(self.base_interval / self.speed_multiplier)
+        else:
+            # For normal and fast speeds, use base interval
+            return self.base_interval
+    
+    def restart_animation(self):
+        """
+        Restart the animation with updated interval based on current speed.
+        This is needed when speed_multiplier changes to apply new timing.
+        """
+        if self.animation_obj and hasattr(self, 'frames_list'):
+            # Stop current animation
+            self.animation_obj.event_source.stop()
+            
+            # Create new animation with updated interval
+            frame_indices = range(len(self.frames_list))
+            current_interval = self.get_current_interval()
+            
+            self.animation_obj = animation.FuncAnimation(
+                self.fig, self.animate_frame, frames=frame_indices,
+                interval=current_interval, blit=True, repeat=True
+            )
+            
+            # Start the new animation
+            self.animation_obj.event_source.start()
+    
     def setup_plot(self):
         """Setup the matplotlib figure and axis."""
         self.fig, self.ax = plt.subplots(figsize=(15, 8))
@@ -201,6 +333,22 @@ class TrajectoryVisualizer:
                                       verticalalignment='top',
                                       zorder=10)  # High z-order to appear on top
         
+        # Initialize control instructions label
+        self.control_text = self.ax.text(0.02, 0.02, '', transform=self.ax.transAxes,
+                                        fontsize=10,
+                                        bbox=dict(boxstyle='round,pad=0.5', 
+                                                 facecolor='lightgreen', 
+                                                 alpha=0.8,
+                                                 edgecolor='black'),
+                                        verticalalignment='bottom',
+                                        zorder=10)
+        
+        # Set up keyboard event handling
+        self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
+        
+        # Update initial control text
+        self.update_control_text()
+        
         # Create legend for action types
         legend_elements = [plt.Rectangle((0,0),1,1, facecolor=color, label=action) 
                           for action, color in self.action_colors.items()]
@@ -208,13 +356,24 @@ class TrajectoryVisualizer:
         
         plt.tight_layout()
         
-    def animate_frame(self, frame_num: int):
+    def animate_frame(self, frame_index: int):
         """
-        Animate a single frame.
+        Animate a single frame with playback control support.
         
         Args:
-            frame_num: Current frame number
+            frame_index: Current frame index in the frames list
         """
+        # Get the actual frame number based on current playback state
+        if hasattr(self, 'frames_list') and self.frames_list:
+            # Get next frame index based on playback controls
+            next_index = self.get_next_frame_index()
+            if next_index < len(self.frames_list):
+                frame_num = self.frames_list[next_index]
+            else:
+                frame_num = self.frames_list[-1]
+        else:
+            frame_num = frame_index
+        
         # Clear previous patches and texts
         for track_id in list(self.track_patches.keys()):
             if self.track_patches[track_id] in self.ax.patches:
@@ -243,8 +402,8 @@ class TrajectoryVisualizer:
             heading = row['heading']  # Keep heading as-is (in degrees)
             width = row['width'] / self.ortho_px_to_meter
             length = row['length'] / self.ortho_px_to_meter
-            action_tags = row['action_tags']
-            speed_tags = row['speed_tags']
+            action_tags = list(row['action_tags'])
+            speed_tags = list(row['speed_tags'])
             
             # Get color based on action
             color = self.get_color_for_action(action_tags)
@@ -263,7 +422,7 @@ class TrajectoryVisualizer:
             
             # Create label text
             action_str, speed_str = self.parse_tags(action_tags, speed_tags)
-            action_str = action_str.replace('waiting', '')
+            # Remove specific keywords from action string, for cleaner display
             if action_str == '':
                 label = ''
             else:
@@ -284,7 +443,9 @@ class TrajectoryVisualizer:
         # Update frame number label
         self.frame_text.set_text(f'Frame: {frame_num}')
         
-        return list(self.track_patches.values()) + list(self.track_texts.values()) + [self.frame_text]
+        return (list(self.track_patches.values()) + 
+                list(self.track_texts.values()) + 
+                [self.frame_text, self.control_text])
     
     def visualize(self, save_animation: bool = False, output_file: str = 'trajectory_animation.mp4'):
         """
@@ -303,26 +464,38 @@ class TrajectoryVisualizer:
         # Get frame range with 3x speed (skip every 3rd frame)
         min_frame = max(self.trajectory_df['frame'].min(), self.tags_df['frame'].min())
         max_frame = min(self.trajectory_df['frame'].max(), self.tags_df['frame'].max())
-        frames = range(0, max_frame + 1, 3)  # Skip every 3rd frame for 3x speed
+        self.frames_list = list(range(0, max_frame + 1, 3))  # Skip every 3rd frame for 3x speed
         
         print(f"Creating animation for frames {min_frame} to {max_frame} (every 3rd frame)")
+        print("Keyboard Controls:")
+        print("  Space: Play/Pause")
+        print("  Left Arrow: Reverse playback")
+        print("  Right Arrow: Forward playback") 
+        print("  Up Arrow: Speed up")
+        print("  Down Arrow: Slow down")
+        print("  R: Reset to normal speed and forward")
+        print("  Escape: Quit")
         
-        # Create animation with 3x faster frame rate
-        anim = animation.FuncAnimation(
-            self.fig, self.animate_frame, frames=frames,
-            interval=66, blit=True, repeat=True  # ~30 FPS (33ms interval) for 3x speed
+        # Create animation with playback control
+        frame_indices = range(len(self.frames_list))
+        current_interval = self.get_current_interval()
+        self.animation_obj = animation.FuncAnimation(
+            self.fig, self.animate_frame, frames=frame_indices,
+            interval=current_interval, blit=True, repeat=True
         )
         
         if save_animation:
             print(f"Saving animation to {output_file}...")
             Writer = animation.writers['ffmpeg']
             writer = Writer(fps=10, metadata=dict(artist='TrajectoryVisualizer'), bitrate=1800)
-            anim.save(output_file, writer=writer)
+            self.animation_obj.save(output_file, writer=writer)
             print("Animation saved!")
         
+        # Make sure the plot window has focus for keyboard events
+        self.fig.canvas.manager.show()
         plt.show()
         
-        return anim
+        return self.animation_obj
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize moving trajectories with tags')

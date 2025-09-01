@@ -308,7 +308,7 @@ def check_turn(start_zone, end_zone, tag):
         return (start_road, end_road) in right_turn
     elif tag == "左轉":
         return (start_road, end_road) in left_turn
-    elif tag == "直行":
+    elif tag == "路口直行":
         return (start_road, end_road) in straight
     return False
 
@@ -417,6 +417,67 @@ def visualize_window(window_traj=None, start_zone=None, end_zone=None, tag="", m
     ax.legend()
     plt.show()
 
+def is_going_straight(heading_history, threshold_angle=15):
+    """
+    基於車頭方向歷史判斷是否在直行
+    :param heading_history: 車頭方向歷史列表
+    :param threshold_angle: 角度閾值（度），超過此閾值認為不是直行
+    :return: True if going straight, False otherwise
+    """
+    if len(heading_history) < 10:  # 需要足夠的歷史數據
+        return False
+    
+    # 計算最近一段時間的heading變化
+    recent_headings = heading_history[-30:]  # 最近30幀
+    
+    # 處理角度環形特性的heading變化計算
+    heading_changes = []
+    for i in range(1, len(recent_headings)):
+        diff = recent_headings[i] - recent_headings[i-1]
+        # 處理角度跨越0/360度的情況
+        if diff > 180:
+            diff -= 360
+        elif diff < -180:
+            diff += 360
+        heading_changes.append(abs(diff))
+    
+    # 如果平均角度變化小於閾值，認為是直行
+    avg_change = np.mean(heading_changes) if heading_changes else 0
+    return avg_change < threshold_angle
+
+def find_intersection_crossing_range(trajectory, min_frames=5):
+    """
+    找出軌跡通過路口的frame range（從進入路口前到離開路口後）
+    :param trajectory: 軌跡點列表
+    :param min_frames: 穩定zone的最小幀數
+    :return: (start_frame, end_frame) 或 None
+    """
+    zones = []
+    for pt in trajectory:
+        point_xy = pt[-2:]  # (x, y)
+        zone = get_zone(point_xy)
+        zones.append(zone)
+    
+    # 找到第一個和最後一個路口zone
+    first_intersection_frame = None
+    last_intersection_frame = None
+    
+    for i, zone in enumerate(zones):
+        if zone and zone.startswith("INT_"):
+            if first_intersection_frame is None:
+                first_intersection_frame = i
+            last_intersection_frame = i
+    
+    if first_intersection_frame is None:
+        return None
+    
+    # 向前擴展一些幀（進入路口前）
+    start_frame = max(0, first_intersection_frame - 30)
+    # 向後擴展一些幀（離開路口後）
+    end_frame = min(len(trajectory) - 1, last_intersection_frame + 30)
+    
+    return (start_frame, end_frame)
+
 def calculate_speed_tags(velocity, acceleration, lon_velocity, lat_velocity, lon_acceleration, lat_acceleration):
     """計算速度相關標籤"""
     speed_tags = []
@@ -445,7 +506,7 @@ def calculate_speed_tags(velocity, acceleration, lon_velocity, lat_velocity, lon
     
     return speed_tags
 
-def calculate_action_tags(current_point, previous_points, current_zone, previous_zones, velocity, heading):
+def calculate_action_tags(current_point, previous_points, current_zone, previous_zones, velocity, heading, heading_history=None):
     """計算動作相關標籤"""
     action_tags = []
     
@@ -455,6 +516,11 @@ def calculate_action_tags(current_point, previous_points, current_zone, previous
         action_tags.append("waiting")
     else:
         action_tags.append("moving")
+    
+    # # 直行判定（基於車頭方向）
+    # if heading_history and len(heading_history) >= 10:
+    #     if is_going_straight(heading_history):
+    #         action_tags.append("straight")
     
     # 車道變換檢測 - 檢測整個跨越車道過程
     if len(previous_zones) >= 10:  # 需要更多歷史數據來檢測完整過程
@@ -529,9 +595,9 @@ def calculate_action_tags(current_point, previous_points, current_zone, previous
                         pass
     
     # 轉向檢測（基於heading變化）
-    if len(previous_points) >= 100:
+    if len(previous_points) >= 45:
         # 計算最近幾幀的heading變化
-        prev_headings = [pt[2] if len(pt) > 2 else heading for pt in previous_points[-100:]]
+        prev_headings = [pt[2] if len(pt) > 2 else heading for pt in previous_points[-45:]]
         
         # 處理角度環形特性的heading變化計算
         heading_changes = []
@@ -545,6 +611,7 @@ def calculate_action_tags(current_point, previous_points, current_zone, previous
             heading_changes.append(diff)
         
         sum_heading_change = np.sum(heading_changes)
+        sum_heading_change_near = np.sum(heading_changes[-30:])
         
         # 檢查是否在路口區域或靠近路口（基於距離）
         is_at_intersection = current_zone is not None and current_zone.startswith("INT_")
@@ -564,6 +631,9 @@ def calculate_action_tags(current_point, previous_points, current_zone, previous
                 action_tags.append("turning_left")
             elif sum_heading_change < -7:
                 action_tags.append("turning_right")
+
+        if abs(sum_heading_change_near) < 4:
+            action_tags.append("straight")
     
     return action_tags
 
@@ -572,9 +642,11 @@ def tag_post_process(action_tags):
     標籤後處理函數，用於過濾不一致的轉向標籤
     
     規則：
-    - 如果同時出現 turning_left/turning_right 和 直行，則移除轉向標籤
+    - 如果同時出現 turning_left/turning_right 和 straight，則移除轉向標籤
     - 如果同時出現 turning_left 和 turning_right，則移除所有轉向標籤
-    - 如果同時出現 左轉/右轉 和 直行，則移除中文轉向標籤
+    - 如果同時出現 左轉/右轉 和 路口直行，則移除中文轉向標籤
+    - 如果同時出現 左轉/右轉 和 straight，則移除中文轉向標籤
+    - 如果同時出現 waiting 和 straight，則移除straight
     
     :param action_tags: 原始標籤列表
     :return: 處理後的標籤列表
@@ -588,7 +660,7 @@ def tag_post_process(action_tags):
     # 定義轉向相關標籤
     turning_tags = {'turning_left', 'turning_right'}
     chinese_turn_tags = {'左轉', '右轉'}
-    straight_tags = {'直行'}
+    straight_tags = {'路口直行', 'straight'}
     
     # 檢查是否有衝突的標籤組合
     has_turning = bool(turning_tags & tag_set)
@@ -603,11 +675,11 @@ def tag_post_process(action_tags):
     for tag in action_tags:
         should_keep = True
         
-        # 規則1: 如果同時有英文轉向和直行，移除英文轉向標籤
+        # 規則1: 如果同時有英文轉向和straight，移除英文轉向標籤
         if tag in turning_tags and has_straight:
             should_keep = False
             
-        # 規則2: 如果同時有中文轉向和直行，移除中文轉向標籤  
+        # 規則2: 如果同時有中文轉向和任何直行標籤，移除中文轉向標籤  
         elif tag in chinese_turn_tags and has_straight:
             should_keep = False
             
@@ -618,7 +690,11 @@ def tag_post_process(action_tags):
         # 規則4: 如果同時有左轉和右轉（中文），移除所有中文轉向標籤
         elif tag in chinese_turn_tags and has_both_chinese_turns:
             should_keep = False
-        
+            
+        # 規則5: 如果同時有waiting和straight，移除straight
+        elif tag in straight_tags and 'waiting' in tag_set:
+            should_keep = False
+
         if should_keep:
             filtered_tags.append(tag)
     
@@ -629,33 +705,51 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
     results = []
     previous_points = []
     previous_zones = []
+    heading_history = []
     
     # 取出完整軌跡用於trajectory_tag_match分析
     trajectory = list(zip(track_data["xCenter"], track_data["yCenter"]))
 
-    for window_size in [330, 450]:  # 嘗試不同窗口大小
-        
+    for target_tag in ["右轉", "左轉", "路口直行"]:
+        for window_size in [330, 450]:  # 嘗試不同窗口大小
+            
 
-        # 執行trajectory_tag_match分析獲取窗口結果
-        window_size = min(len(trajectory), window_size)
-        window_results = trajectory_tag_match(trajectory, target_tag, track_id, 
-                                            window_size=window_size, slide_step=30, 
-                                            min_frames=6, visualize=False)
+            # 執行trajectory_tag_match分析獲取窗口結果
+            window_size = min(len(trajectory), window_size)
+            window_results = trajectory_tag_match(trajectory, target_tag, track_id, 
+                                                window_size=window_size, slide_step=30, 
+                                                min_frames=6, visualize=False)
+            # print(window_results)
 
-        # 建立frame到window標籤的映射
-        frame_to_window_tags = {}
-        for window in window_results:
-            start_frame = window['start_frame']
-            end_frame = window['end_frame']
-            turn_tag = window['turn_tag']
-            for frame_idx in range(start_frame, end_frame + 1):
-                if frame_idx not in frame_to_window_tags:
-                    frame_to_window_tags[frame_idx] = []
-                if turn_tag:
-                    frame_to_window_tags[frame_idx].append(turn_tag)
+            # 建立frame到window標籤的映射
+            frame_to_window_tags = {}
+            for window in window_results:
+                start_frame = window['start_frame']
+                end_frame = window['end_frame']
+                turn_tag = window['turn_tag']
+                
+                # 對於'路口直行'標籤，限縮frame range到路口附近
+                if turn_tag == '路口直行':
+                    window_traj = trajectory[start_frame:end_frame+1]
+                    intersection_range = find_intersection_crossing_range(window_traj)
+                    if intersection_range:
+                        # 調整實際的frame範圍
+                        actual_start = start_frame + intersection_range[0]
+                        actual_end = start_frame + intersection_range[1]
+                        for frame_idx in range(actual_start, actual_end + 1):
+                            if frame_idx not in frame_to_window_tags:
+                                frame_to_window_tags[frame_idx] = []
+                            frame_to_window_tags[frame_idx].append(turn_tag)
+                else:
+                    # 其他標籤保持原有範圍
+                    for frame_idx in range(start_frame, end_frame + 1):
+                        if frame_idx not in frame_to_window_tags:
+                            frame_to_window_tags[frame_idx] = []
+                        if turn_tag:
+                            frame_to_window_tags[frame_idx].append(turn_tag)
 
-        if window_results is not None or len(trajectory) < window_size:
-            break
+            if window_results is not None or len(trajectory) < window_size:
+                break
                     
                     
     
@@ -673,8 +767,13 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
         current_point = (x, y, heading)
         current_zone = get_zone((x, y))
         
-        # 計算基本動作標籤（不再需要未來zone信息）
-        action_tags = calculate_action_tags(current_point, previous_points, current_zone, previous_zones, velocity, heading)
+        # 更新heading歷史
+        heading_history.append(heading)
+        if len(heading_history) > 100:  # 保持歷史記錄在合理範圍內
+            heading_history.pop(0)
+        
+        # 計算基本動作標籤（傳入heading_history）
+        action_tags = calculate_action_tags(current_point, previous_points, current_zone, previous_zones, velocity, heading, heading_history)
         
         # 添加trajectory_tag_match的結果到action_tags中
         if frame_idx in frame_to_window_tags:
@@ -691,7 +790,7 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
         
         results.append({
             'trackId': track_id,
-            'frame': frame,
+            'frame': int(frame),
             'action_tags': action_tags,
             'speed_tags': speed_tags
         })
@@ -737,9 +836,9 @@ def trajectory_tag_match(trajectory, tag, track_id, window_size=200, slide_step=
             elif check_turn(start_zone, end_zone, "左轉"):
                 turn_tag = "左轉"
                 match = (tag == "左轉")
-            elif check_turn(start_zone, end_zone, "直行"):
-                turn_tag = "直行"
-                match = (tag == "直行")
+            elif check_turn(start_zone, end_zone, "路口直行"):
+                turn_tag = "路口直行"
+                match = (tag == "路口直行")
             else:
                 continue
                 turn_tag = "其他"
@@ -785,14 +884,15 @@ if __name__ == "__main__":
     all_frame_results = []
     
     # 依 trackId 分組
-    tag = "右轉"  # 可改成 "左轉" 或 "直行"
+    tag = "路口直行"  # 可改成 "左轉" 或 "右轉"
 
     for track_id, group in df.groupby("trackId"):
         # print(track_id)
         # 限制處理數量以便測試
-        # if track_id != 25:  # 只處理前6個tracks作為示例
+        # if track_id > 10:  # 只處理前6個tracks作為示例
         #     continue
-        
+        if track_id in [52,51,20,729,988,484,1529,953,1616]:
+            continue
         # 按 frame 排序
         group_sorted = group.sort_values("frame")
         
@@ -805,13 +905,13 @@ if __name__ == "__main__":
     # 將幀級別結果轉換為DataFrame並保存
     tags_df = pd.DataFrame(all_frame_results)
     
-    # 將標籤列表轉換為字符串格式
-    tags_df['action_tags'] = tags_df['action_tags'].apply(lambda x: str(x))
-    tags_df['speed_tags'] = tags_df['speed_tags'].apply(lambda x: str(x))
-    
-    # 保存為統一的CSV文件
-    output_path = "/home/hcis-s19/Documents/ChengYu/HetroD_sample/tags.csv"
-    tags_df.to_csv(output_path, index=False)
+    # # 將標籤列表轉換為字符串格式
+    # tags_df['action_tags'] = tags_df['action_tags'].apply(lambda x: str(x))
+    # tags_df['speed_tags'] = tags_df['speed_tags'].apply(lambda x: str(x))
+
+    # 保存為統一的Parquet文件
+    output_path = "/home/hcis-s19/Documents/ChengYu/HetroD_sample/tags.parquet"
+    tags_df.to_parquet(output_path, index=False)
     
     print(f"Results saved to {output_path}")
     
