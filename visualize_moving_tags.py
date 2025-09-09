@@ -22,7 +22,7 @@ import cv2
 import polars as pl
 
 warnings.filterwarnings('ignore')    
-plt.rcParams["font.family"] = 'WenQuanYi Zen Hei' #Droid Sans Fallback
+plt.rcParams["font.family"] = ['WenQuanYi Zen Hei', 'DejaVu Sans'] #Droid Sans Fallback
 plt.rcParams["axes.unicode_minus"] = False
 
 class TrajectoryVisualizer:
@@ -56,6 +56,7 @@ class TrajectoryVisualizer:
         self.animation_obj = None
         self.control_text = None  # Text object for control instructions
         self.base_interval = 50  # Base interval in ms for normal speed (~15 FPS)
+
         
         # Dataset specific parameters - no scaling needed for full display
         self.ortho_px_to_meter = 0.0499967249445942  # From recording meta
@@ -77,6 +78,14 @@ class TrajectoryVisualizer:
             'moving': 'darkseagreen',
             'stopped': 'gray'
         }
+                
+        # Tag filtering variables
+        self.visible_tags = set(self.action_colors.keys())  # Initially show all tags
+        self.tag_selection_mode = False  # Toggle for tag selection interface
+        self.tag_text = None  # Text object for tag selection display
+        self.tag_list = list(self.action_colors.keys())  # Fixed order list of all tags
+        self.current_tag_page = 0  # Current page for tag selection (10 tags per page)
+        self.tags_per_page = 10
         
         # Default color if tag not found
         self.default_color = 'black'
@@ -112,42 +121,50 @@ class TrajectoryVisualizer:
         
         print(f"Loaded {len(self.trajectory_df)} trajectory points for {len(unique_track_ids)} tracks")
         
-    def parse_tags(self, action_tags: List[str], speed_tags: List[str]) -> Tuple[str, str]:
+    def parse_tags(self, action_tags: List[str], speed_tags: List[str]) -> Tuple[str, str, bool]:
         """
-        Parse action and speed tags to get display strings.
+        Parse action and speed tags to get display strings and visibility.
         
         Args:
             action_tags: List of action tags
             speed_tags: List of speed tags
             
         Returns:
-            Tuple of (action_string, speed_string)
+            Tuple of (action_string, speed_string, should_show_text)
         """
         # Remove 'moving' and 'waiting' from action tags for cleaner display
         action_tags = [tag for tag in action_tags if tag != 'moving' and tag != 'waiting']
-        action_str = ', '.join(action_tags) if action_tags else ''
+        
+        # Check if any action tag is visible
+        visible_action_tags = [tag for tag in action_tags if tag in self.visible_tags]
+        should_show_text = len(visible_action_tags) > 0
+        
+        action_str = ', '.join(visible_action_tags) if visible_action_tags else ''
         speed_str = ', '.join(speed_tags) if speed_tags else ''
-        return action_str, speed_str
+        return action_str, speed_str, should_show_text
     
-    def get_color_for_action(self, action_tags: List[str]) -> str:
+    def get_color_for_action(self, action_tags: List[str]) -> Tuple[str, bool]:
         """
-        Get color based on primary action tag.
+        Get color based on primary action tag, considering visibility filter.
         
         Args:
             action_tags: List of action tags
             
         Returns:
-            Color string
+            Tuple of (color_string, should_display_track)
         """
         if not action_tags:
-            return self.default_color
+            return self.default_color, True
 
         priority_actions = self.action_colors.keys()
-        action = [tag for tag in priority_actions if tag in action_tags]
+        visible_actions = [tag for tag in priority_actions if tag in action_tags and tag in self.visible_tags]
+        
+        if not visible_actions:
+            return None, False  # This track should not be displayed
 
-        # Use the first action tag for color
-        primary_action = action[0]
-        return self.action_colors.get(primary_action, self.default_color)
+        # Use the first visible action tag for color
+        primary_action = visible_actions[0]
+        return self.action_colors.get(primary_action, self.default_color), True
     
     def create_bounding_box(self, x: float, y: float, heading: float, 
                            width: float, length: float) -> Rectangle:
@@ -182,7 +199,7 @@ class TrajectoryVisualizer:
     
     def on_key_press(self, event):
         """
-        Handle keyboard events for playback control.
+        Handle keyboard events for playback control and tag selection.
         
         Args:
             event: Keyboard event
@@ -221,21 +238,112 @@ class TrajectoryVisualizer:
             print("Reset to normal speed and forward playback")
             self.restart_animation()
         
+        elif event.key == 't':  # T key - toggle tag selection mode
+            self.tag_selection_mode = not self.tag_selection_mode
+            if self.tag_selection_mode:
+                print("Tag selection mode ON - Use 1-9,0 to toggle tags, Left/Right to change page")
+                self.show_current_tag_page()
+            else:
+                print("Tag selection mode OFF")
+        
+        elif event.key in '1234567890' and self.tag_selection_mode:  # Number keys - toggle individual tags
+            if event.key == '0':
+                index = 9
+            else:
+                index = int(event.key) - 1
+            
+            start_index = self.current_tag_page * self.tags_per_page
+            actual_index = start_index + index
+            
+            if 0 <= actual_index < len(self.tag_list):
+                tag = self.tag_list[actual_index]
+                if tag in self.visible_tags:
+                    self.visible_tags.remove(tag)
+                    print(f"Tag '{tag}' hidden")
+                else:
+                    self.visible_tags.add(tag)
+                    print(f"Tag '{tag}' shown")
+                self.show_current_tag_page()
+        
+        elif event.key == 'ctrl+left' and self.tag_selection_mode:  # Ctrl+Left - previous page
+            max_pages = (len(self.tag_list) - 1) // self.tags_per_page
+            self.current_tag_page = max(0, self.current_tag_page - 1)
+            print(f"Tag page {self.current_tag_page + 1}/{max_pages + 1}")
+            self.show_current_tag_page()
+        
+        elif event.key == 'ctrl+right' and self.tag_selection_mode:  # Ctrl+Right - next page
+            max_pages = (len(self.tag_list) - 1) // self.tags_per_page
+            self.current_tag_page = min(max_pages, self.current_tag_page + 1)
+            print(f"Tag page {self.current_tag_page + 1}/{max_pages + 1}")
+            self.show_current_tag_page()
+        
+        elif event.key == 'a':  # A key - show all tags
+            self.visible_tags = set(self.action_colors.keys())
+            print("All tags shown")
+        
+        elif event.key == 'n':  # N key - hide all tags
+            self.visible_tags = set()
+            print("All tags hidden")
+        
         elif event.key == 'escape':  # Escape - quit
             plt.close(self.fig)
         
-        # Update control instructions
+        # Update control instructions and tag display
         self.update_control_text()
+        self.update_tag_text()
+    
+    def show_current_tag_page(self):
+        """Show the current page of tags in tag selection mode."""
+        start_index = self.current_tag_page * self.tags_per_page
+        end_index = min(start_index + self.tags_per_page, len(self.tag_list))
+        max_pages = (len(self.tag_list) - 1) // self.tags_per_page + 1
+        
+        print(f"\nTag Selection Page {self.current_tag_page + 1}/{max_pages}:")
+        for i in range(start_index, end_index):
+            key = '0' if (i - start_index) == 9 else str((i - start_index) + 1)
+            tag = self.tag_list[i]
+            status = "✓" if tag in self.visible_tags else "✗"
+            print(f"  {key}: {status} {tag}")
+        
+        if max_pages > 1:
+            print("Use Ctrl+Left/Right to change pages")
     
     def update_control_text(self):
         """Update the control instructions text display."""
         direction = "Reverse" if self.is_reverse else "Forward"
         status = "Playing" if self.is_playing else "Paused"
-        controls = (f"Controls: Space=Play/Pause | ←→=Direction | ↑↓=Speed | R=Reset | ESC=Quit\n"
-                   f"Status: {status} | Direction: {direction} | Speed: {self.speed_multiplier:.1f}x")
+        tag_mode = "ON" if self.tag_selection_mode else "OFF"
+        controls = (f"Controls: Space=Play/Pause | ←→=Direction | ↑↓=Speed | R=Reset | T=Tag Selection | A=All Tags | N=No Tags | ESC=Quit\n"
+                   f"Status: {status} | Direction: {direction} | Speed: {self.speed_multiplier:.1f}x | Tag Mode: {tag_mode}")
         
         if self.control_text:
             self.control_text.set_text(controls)
+    
+    def update_tag_text(self):
+        """Update the tag selection display."""
+        if self.tag_selection_mode:
+            start_index = self.current_tag_page * self.tags_per_page
+            end_index = min(start_index + self.tags_per_page, len(self.tag_list))
+            max_pages = (len(self.tag_list) - 1) // self.tags_per_page + 1
+            
+            tag_info = f"Tag Selection Page {self.current_tag_page + 1}/{max_pages} (1-9,0 to toggle):\n"
+            for i in range(start_index, end_index):
+                key = '0' if (i - start_index) == 9 else str((i - start_index) + 1)
+                tag = self.tag_list[i]
+                status = "✓" if tag in self.visible_tags else "✗"
+                tag_info += f"{key}:{status}{tag} "
+                if ((i - start_index) + 1) % 3 == 0:  # New line every 3 tags for better formatting
+                    tag_info += "\n"
+            
+            if max_pages > 1:
+                tag_info += "\nCtrl+←/→: Change page"
+        else:
+            visible_count = len(self.visible_tags)
+            total_count = len(self.action_colors)
+            tag_info = f"Visible Tags: {visible_count}/{total_count}"
+        
+        if self.tag_text:
+            self.tag_text.set_text(tag_info)
     
     def get_next_frame_index(self):
         """
@@ -343,11 +451,23 @@ class TrajectoryVisualizer:
                                         verticalalignment='bottom',
                                         zorder=10)
         
+        # Initialize tag selection label
+        self.tag_text = self.ax.text(0.98, 0.02, '', transform=self.ax.transAxes,
+                                    fontsize=9,
+                                    bbox=dict(boxstyle='round,pad=0.5', 
+                                             facecolor='lightcyan', 
+                                             alpha=0.8,
+                                             edgecolor='black'),
+                                    verticalalignment='bottom',
+                                    horizontalalignment='right',
+                                    zorder=10)
+        
         # Set up keyboard event handling
         self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
         
-        # Update initial control text
+        # Update initial control text and tag text
         self.update_control_text()
+        self.update_tag_text()
         
         # Create legend for action types
         legend_elements = [plt.Rectangle((0,0),1,1, facecolor=color, label=action) 
@@ -405,8 +525,12 @@ class TrajectoryVisualizer:
             action_tags = list(row['action_tags'])
             speed_tags = list(row['speed_tags'])
             
-            # Get color based on action
-            color = self.get_color_for_action(action_tags)
+            # Get color based on action and visibility filter
+            color, should_display = self.get_color_for_action(action_tags)
+            
+            # Skip this track if it should not be displayed
+            if not should_display:
+                continue
             
             # Create bounding box
             bbox = self.create_bounding_box(x, y, heading, width, length)
@@ -420,32 +544,30 @@ class TrajectoryVisualizer:
             self.ax.add_patch(bbox)
             self.track_patches[track_id] = bbox
             
-            # Create label text
-            action_str, speed_str = self.parse_tags(action_tags, speed_tags)
-            # Remove specific keywords from action string, for cleaner display
-            if action_str == '':
-                label = ''
-            else:
-                label = f"ID:{track_id}\n{action_str}" # \n{speed_str}"
+            # Create label text only if there are visible tags
+            action_str, speed_str, should_show_text = self.parse_tags(action_tags, speed_tags)
             
-            # Position text above the bounding box
-            text_y = y + length/2 + 80
-            text = self.ax.text(x, text_y, label, 
-                              ha='center', va='bottom',
-                              fontsize=8, 
-                              bbox=dict(boxstyle='round,pad=0.3', 
-                                       facecolor='white', 
-                                       alpha=0.8,
-                                       edgecolor='gray'),
-                              zorder=3)  # Ensure text appears above everything
-            self.track_texts[track_id] = text
+            if should_show_text and action_str:  # Only show text if there are visible action tags
+                label = f"ID:{track_id}\n{action_str}" # \n{speed_str}"
+                
+                # Position text above the bounding box
+                text_y = y + length/2 + 80
+                text = self.ax.text(x, text_y, label, 
+                                  ha='center', va='bottom',
+                                  fontsize=8, 
+                                  bbox=dict(boxstyle='round,pad=0.3', 
+                                           facecolor='white', 
+                                           alpha=0.8,
+                                           edgecolor='gray'),
+                                  zorder=3)  # Ensure text appears above everything
+                self.track_texts[track_id] = text
         
         # Update frame number label
         self.frame_text.set_text(f'Frame: {frame_num}')
         
         return (list(self.track_patches.values()) + 
                 list(self.track_texts.values()) + 
-                [self.frame_text, self.control_text])
+                [self.frame_text, self.control_text, self.tag_text])
     
     def visualize(self, save_animation: bool = False, output_file: str = 'trajectory_animation.mp4'):
         """
@@ -474,6 +596,11 @@ class TrajectoryVisualizer:
         print("  Up Arrow: Speed up")
         print("  Down Arrow: Slow down")
         print("  R: Reset to normal speed and forward")
+        print("  T: Toggle tag selection mode")
+        print("  1-9,0: Toggle individual tags (in tag selection mode)")
+        print("  Ctrl+Left/Right: Change tag pages (in tag selection mode)")
+        print("  A: Show all tags")
+        print("  N: Hide all tags")
         print("  Escape: Quit")
         
         # Create animation with playback control

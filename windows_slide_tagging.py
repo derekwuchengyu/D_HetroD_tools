@@ -132,6 +132,7 @@ class ZonePolygon:
             data = json.load(f)
         lane_segments = data.get("lane_segments", {})
         drivable_areas = data.get("drivable_areas", {})
+        self_defined_areas = data.get("self_defined_area", {})
         
         df = pd.read_csv(recording_meta_file)
         xUtmOrigin = df['xUtmOrigin'].values[0]
@@ -141,6 +142,8 @@ class ZonePolygon:
         self.ZONE_POLYGON = {}
 
         for zone, lane_ids in self.ZONE_MAPPING_REV.items():
+            # if not zone.startswith("Z"):
+            #     continue
             self.ZONE_POLYGON[zone] = []
 
             lane_polygons = []
@@ -153,6 +156,14 @@ class ZonePolygon:
                         continue
                     
                     coords = [(pt["x"]-xUtmOrigin, pt["y"]-yUtmOrigin) for pt in intersection["area_boundary"]]
+                    
+                elif zone.startswith("Z"):
+                    zone_id = lane_id
+                    area = self_defined_areas.get(str(zone_id)) or self_defined_areas.get(int(zone_id))
+                    if not area:
+                        continue
+                    
+                    coords = [(pt["x"]-xUtmOrigin, pt["y"]-yUtmOrigin) for pt in area["area_boundary"]]
                      
                 else:
                     lane = lane_segments.get(str(lane_id)) or lane_segments.get(int(lane_id))
@@ -190,7 +201,6 @@ class ZonePolygon:
                 elif merged.geom_type == "MultiPolygon":
                     for sub_poly in merged.geoms:
                         self.ZONE_POLYGON[zone].append(list(sub_poly.exterior.coords))
-
         return self.ZONE_POLYGON
 
 
@@ -223,13 +233,24 @@ def is_point_in_polygon(point, polygon):
 
 ZONE_POLYGON = ZonePolygon().ZONE_POLYGON
 # print(ZONE_POLYGON)
-def get_zone(point):
+def get_zone(point, type="drivable"):
     """
     獲取點所在的區域
     :param point: (x, y) 座標點
     """
+    # find_zones_list = list(ZONE_POLYGON.keys())
+    if type == "drivable":
+        find_zones_list = [zone_name for zone_name in ZONE_POLYGON.keys() if zone_name.startswith("INT_") or zone_name.startswith("R")]
+    elif type == "in_n_out_zone":
+        find_zones_list = [zone_name for zone_name in ZONE_POLYGON.keys() if zone_name.startswith("Z")]
+    # exit(ZONE_POLYGON.keys())
+    
     for zone_name, polygons in ZONE_POLYGON.items():
+        if zone_name not in find_zones_list:
+            continue
+        
         for polygon in polygons:
+            # print(f"Checking point {point} in zone {zone_name} polygon with {(polygon)} points")
             if is_point_in_polygon(point, polygon):
                 return zone_name
     return None
@@ -299,10 +320,10 @@ def check_turn(start_zone, end_zone, tag):
     start_lane = start_zone.split('_')[1]
     end_road = end_zone.split('_')[0]
     end_lane = end_zone.split('_')[1]
-    
-    right_turn = {("RI", "RII"), ("RII", "RIII"), ("RIII", "RIV"), ("RIV", "RI"), ("RV", "RI")}
-    left_turn = {("RI", "RIV"), ("RIV", "RIII"), ("RIII", "RII"), ("RII", "RI")}
-    straight = {("RI", "RIII"), ("RIII", "RI"), ("RII", "RIV"), ("RIV", "RII")}
+
+    right_turn = {("Z1", "Z2"), ("Z2", "Z3"), ("Z3", "Z4"), ("Z4", "Z1")}
+    left_turn = {("Z1", "Z4"), ("Z4", "Z3"), ("Z3", "Z2"), ("Z2", "Z1")}
+    straight = {("Z1", "Z3"), ("Z3", "Z1"), ("Z2", "Z4"), ("Z4", "Z2")}
 
     if tag == "右轉":
         return (start_road, end_road) in right_turn
@@ -312,7 +333,7 @@ def check_turn(start_zone, end_zone, tag):
         return (start_road, end_road) in straight
     return False
 
-def find_first_last_zone(trajectory, min_frames=5):
+def find_first_last_zone(trajectory, min_frames=5, type="drivable"):
     """
     找出 trajectory 的第一個穩定 zone 與最後一個穩定 zone
     min_frames: 進入同一 zone 連續幾幀才算穩定
@@ -328,7 +349,7 @@ def find_first_last_zone(trajectory, min_frames=5):
     # print(trajectory[0][-2:], zone)
     for pt in trajectory:
         point_xy = pt[-2:]  # (x, y)
-        zone = get_zone(point_xy)
+        zone = get_zone(point_xy, type=type)
         # print(point_xy, zone)
 
         if zone == prev_zone and zone is not None:
@@ -679,9 +700,9 @@ def tag_post_process(action_tags):
         if tag in turning_tags and has_straight:
             should_keep = False
             
-        # 規則2: 如果同時有中文轉向和任何直行標籤，移除中文轉向標籤  
-        elif tag in chinese_turn_tags and has_straight:
-            should_keep = False
+        # # 規則2: 如果同時有中文轉向和任何直行標籤，移除中文轉向標籤  
+        # elif tag in chinese_turn_tags and has_straight:
+        #     should_keep = False
             
         # 規則3: 如果同時有左轉和右轉（英文），移除所有轉向標籤
         elif tag in turning_tags and has_both_turns:
@@ -710,15 +731,17 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
     # 取出完整軌跡用於trajectory_tag_match分析
     trajectory = list(zip(track_data["xCenter"], track_data["yCenter"]))
 
-    for target_tag in ["右轉", "左轉", "路口直行"]:
-        for window_size in [330, 450]:  # 嘗試不同窗口大小
+    for target_tag in ["左轉", "右轉", "路口直行"]:
+        for windows_size in [130, 330, 450, 600, 900]:  # 嘗試不同窗口大小
+            # print('='*25+str(windows_size)+'='*25)
             
 
             # 執行trajectory_tag_match分析獲取窗口結果
-            window_size = min(len(trajectory), window_size)
+            window_size = min(len(trajectory), windows_size)
             window_results = trajectory_tag_match(trajectory, target_tag, track_id, 
                                                 window_size=window_size, slide_step=30, 
                                                 min_frames=6, visualize=False)
+            
             # print(window_results)
 
             # 建立frame到window標籤的映射
@@ -748,10 +771,13 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
                         if turn_tag:
                             frame_to_window_tags[frame_idx].append(turn_tag)
 
-            if window_results is not None or len(trajectory) < window_size:
+            # print(f"Found {len(window_results)} windows for tag '{target_tag}' with window size {window_size}.", len(trajectory))
+            if len(window_results) > 0 or len(trajectory) < window_size:
+                print('*'*70)
                 break
                     
-                    
+    # exit(frame_to_window_tags)
+                        
     
     for frame_idx, (idx, row) in enumerate(track_data.iterrows()):
         frame = row['frame']
@@ -785,6 +811,7 @@ def analyze_trajectory_frame_by_frame(track_data, track_id, target_tag="右轉")
         
         # 應用標籤後處理，過濾不一致的轉向標籤
         action_tags = tag_post_process(action_tags)
+        # print(action_tags)
         
         speed_tags = calculate_speed_tags(velocity, acceleration, lon_velocity, lat_velocity, lon_acceleration, lat_acceleration)
         
@@ -823,7 +850,7 @@ def trajectory_tag_match(trajectory, tag, track_id, window_size=200, slide_step=
         end_idx = start_idx + window_size
         window_traj = trajectory[start_idx:end_idx]
 
-        start_zone, end_zone = find_first_last_zone(window_traj, min_frames=min_frames)
+        start_zone, end_zone = find_first_last_zone(window_traj, min_frames=min_frames, type="in_n_out_zone")
         # print(f"Track {track_id} Window {start_idx}-{end_idx}: Start Zone: {start_zone}, End Zone: {end_zone}")
 
         match = False
@@ -843,7 +870,10 @@ def trajectory_tag_match(trajectory, tag, track_id, window_size=200, slide_step=
                 continue
                 turn_tag = "其他"
                 match = False
-
+                
+        if not match:
+            continue
+        
         # 記錄窗口結果
         window_result = {
             'trackId': track_id,
@@ -875,6 +905,7 @@ if __name__ == "__main__":
     # from your_module import trajectory_tag_match
 
     csv_path = "/home/hcis-s19/Documents/ChengYu/HetroD_sample/dataset_tools_612db6a0/data/00_tracks.csv"
+    # csv_path = "/home/hcis-s19/Documents/ChengYu/HetroD_sample/00_tracks_0-367.csv"
 
     # 讀 CSV
     df = pd.read_csv(csv_path)
